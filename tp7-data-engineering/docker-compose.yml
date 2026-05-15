@@ -1,0 +1,108 @@
+# Week 7 – Docker Compose: Airflow + Spark + PostgreSQL
+#
+# How to start:
+#   docker-compose up -d
+#
+# Access Airflow UI:
+#   http://localhost:8080   (user: airflow / password: airflow)
+#
+# How to stop:
+#   docker-compose down
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.8.0
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    # DB connection for the ETL load step
+    DB_TYPE: postgresql
+    DB_HOST: postgres
+    DB_PORT: 5432
+    DB_NAME: etl_db
+    DB_USER: etl_user
+    DB_PASSWORD: etl_password
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./spark_jobs:/opt/airflow/spark_jobs
+    - ./scripts:/opt/airflow/scripts
+    - airflow_logs:/opt/airflow/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+
+  # ── PostgreSQL (Airflow metadata + ETL target DB) ──────────────────────
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+
+  # ── Airflow webserver ──────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ── Airflow scheduler ──────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+
+  # ── Airflow init (creates DB schema + admin user) ─────────────────────
+  airflow-init:
+    <<: *airflow-common
+    command: bash -c "airflow db init && airflow users create --username airflow --password airflow --firstname Admin --lastname User --role Admin --email admin@example.com"
+    restart: "no"
+
+  # ── Apache Spark master ────────────────────────────────────────────────
+  spark-master:
+    image: apache/spark:3.5.1
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    ports:
+      - "7077:7077"   # Spark master port
+      - "8081:8080"   # Spark web UI (mapped to 8081 to avoid conflict)
+
+  # ── Apache Spark worker ────────────────────────────────────────────────
+  spark-worker:
+    image: apache/spark:3.5.1
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+    depends_on:
+      - spark-master
+    volumes:
+      - ./spark_jobs:/opt/airflow/spark_jobs
+
+volumes:
+  postgres_data:
+  airflow_logs:
